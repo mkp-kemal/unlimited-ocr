@@ -1,0 +1,18 @@
+# Virtualenv (799 MB) — dibuat ulang lewat perintah di README
+.venv/
+
+# Bytecode Python
+__pycache__/
+*.py[cod]
+
+# Keluaran OCR: bisa dihasilkan ulang dari dokumen sumbernya
+hasil/
+hasil-*/
+
+# Bobot model sebenarnya ada di ~/.cache/huggingface, bukan di sini. Ini jaga-jaga
+# kalau HF_HOME suatu saat diarahkan ke dalam folder ini.
+model/
+*.safetensors
+
+# macOS
+.DS_Store
