@@ -307,6 +307,20 @@ def jalankan(berkas, nama_mesin, dpi, max_tokens, prompt):
             yield from jalankan_subproses(cfg, src, gambar, halaman, cache)
 
 
+# Tinggi ketiga panel dikunci dan digulir sendiri-sendiri. Tanpa ini, panel tengah
+# tumbuh mengikuti isi lalu mendorong tata letak tiap kali stream memperbarui.
+CSS = """
+.kolom-panel { height: 640px; overflow: hidden; }
+.kolom-panel .gradio-image, .kolom-panel img { object-fit: contain; }
+.kolom-panel .prose { overflow-y: auto; height: 100%; }
+/* Tinggi textarea dipaksa: Gradio menumbuhkannya mengikuti isi, jadi panel tengah
+   melompat sekali saat teks pertama masuk. */
+.kolom-panel textarea { height: 560px !important; resize: none; }
+/* Kotak unggah bawaan setinggi ~320px mendorong ketiga panel keluar layar. */
+#kotak-unggah { height: 130px; }
+#kotak-unggah .wrap { min-height: 0; }
+"""
+
 with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
     gr.Markdown(
         "# Banding OCR di Apple Silicon\n"
@@ -319,6 +333,7 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
             file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"],
             type="filepath",
             scale=3,
+            elem_id="kotak-unggah",
         )
         mesin = gr.Dropdown(list(MESIN), value=list(MESIN)[0], label="Engine", scale=2)
     with gr.Row():
@@ -331,15 +346,22 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
     status = gr.Markdown("")
 
     with gr.Row(equal_height=True):
-        with gr.Column():
+        with gr.Column(elem_classes=["kolom-panel"]):
             gr.Markdown("### Dokumen")
-            tampil = gr.Image(show_label=False, height=620, type="pil")
-        with gr.Column():
+            tampil = gr.Image(show_label=False, height=580, type="pil")
+        with gr.Column(elem_classes=["kolom-panel"]):
             gr.Markdown("### Output mentah")
-            mentah = gr.Code(lines=28, wrap_lines=True)
-        with gr.Column():
+            # Textbox, bukan Code: hanya Textbox yang punya autoscroll. Tanpa itu,
+            # gulirannya melompat ke atas tiap pembaruan karena isinya diganti utuh.
+            mentah = gr.Textbox(
+                show_label=False,
+                lines=24,
+                max_lines=24,
+                autoscroll=True,
+            )
+        with gr.Column(elem_classes=["kolom-panel"]):
             gr.Markdown("### Markdown")
-            bersih = gr.Markdown(height=620, container=True)
+            bersih = gr.Markdown(height=580, container=True)
 
     tombol.click(
         jalankan,
@@ -348,4 +370,5 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False)
+    # css pindah ke launch() sejak Gradio 6.
+    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False, css=CSS)
