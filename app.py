@@ -14,11 +14,17 @@ import json
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import gradio as gr
+import pandas as pd
 from PIL import Image, ImageDraw
 
+from biaya import catat
+from field import FIELD_BAWAAN, teks_untuk_llm
+from parser_field import cari as cari_field
+from llm import MODEL_BAWAAN, MODEL_LLM, PROMPT_ANALISIS, ambil_field, analisis, baca_env
 from ocr import (
     IMAGE_EXT,
     MODEL,
@@ -197,6 +203,7 @@ def jalankan_unlimited(gambar, halaman, max_tokens, prompt, cache):
                 ),
                 f"Halaman {nomor}/{len(gambar)} — {n_kotak} blok, {n_token} token, "
                 f"{lewat:.1f} s ({n_token / max(lewat, 0.01):.0f} token/s)",
+                nomor,
             )
 
         selesai.append(f"<!-- halaman {nomor} -->\n{buf.strip()}")
@@ -239,6 +246,20 @@ def jalankan_subproses(cfg, src, gambar, halaman, cache):
                 "",
                 "",
                 f"{ev['mesin']} siap ({ev['detik_muat']} s) — {cfg['catatan']}",
+                None,
+            )
+
+        elif ev["t"] == "halaman_mulai":
+            n = ev["n"]
+            # Engine batch membaca satu halaman utuh dulu, baru mengirim semua bloknya.
+            # Halamannya ditampilkan sekarang supaya jelas apa yang sedang dikerjakan.
+            yield (
+                pil_per_halaman[n],
+                gr.skip(),
+                gr.skip(),
+                f"Membaca halaman {n}/{len(gambar)} — engine ini memproses satu halaman "
+                f"utuh sebelum hasilnya keluar ({time.perf_counter() - t_awal:.0f} s berjalan)",
+                n,
             )
 
         elif ev["t"] == "blok":
@@ -258,6 +279,7 @@ def jalankan_subproses(cfg, src, gambar, halaman, cache):
                 ),
                 f"Halaman {n}/{len(gambar)} — {len(blok)} blok, "
                 f"{time.perf_counter() - t_awal:.1f} s",
+                n,
             )
 
         elif ev["t"] == "halaman_selesai":
@@ -295,16 +317,33 @@ def jalankan(berkas, nama_mesin, dpi, max_tokens, prompt):
         gambar = siapkan_halaman(src, dpi, tmpdir)
         halaman = [(n, Image.open(p).convert("RGB")) for n, p in gambar]
         cache = {}
-        yield halaman[0][1], "", "", f"{nama_mesin} — {len(gambar)} halaman, menyiapkan..."
+        # Gambar terakhir tiap halaman — mula-mula halaman polos, lalu diganti versi
+        # ber-highlight. Dipakai tombol halaman setelah (dan selama) OCR berjalan.
+        daftar = [pil for _, pil in halaman]
+        kini = 0
+
+        def label(i):
+            return f"Halaman {i + 1} / {len(daftar)}"
+
+        yield (daftar[0], "", "", f"{nama_mesin} — {len(gambar)} halaman, menyiapkan...",
+               daftar, kini, label(kini))
 
         if cfg["jenis"] == "lokal":
-            yield from jalankan_unlimited(gambar, halaman, max_tokens, prompt, cache)
+            sumber = jalankan_unlimited(gambar, halaman, max_tokens, prompt, cache)
         else:
             if cfg.get("server"):
                 pastikan_server(cfg, nama_mesin)
             if cfg["umpan"] == "dokumen" and src.suffix.lower() != ".pdf":
                 raise gr.Error(f"{nama_mesin} pada demo ini hanya menerima PDF.")
-            yield from jalankan_subproses(cfg, src, gambar, halaman, cache)
+            sumber = jalankan_subproses(cfg, src, gambar, halaman, cache)
+
+        for keluaran in sumber:
+            img, mentah_, md, status_, n = (*keluaran, None)[:5]
+            if n is not None:
+                kini = n - 1
+                if isinstance(img, Image.Image):
+                    daftar[kini] = img
+            yield img, mentah_, md, status_, daftar, kini, label(kini)
 
 
 # Tinggi ketiga panel dikunci dan digulir sendiri-sendiri. Tanpa ini, panel tengah
@@ -318,8 +357,271 @@ CSS = """
 .kolom-panel textarea { height: 560px !important; resize: none; }
 /* Kotak unggah bawaan setinggi ~320px mendorong ketiga panel keluar layar. */
 #kotak-unggah { height: 130px; }
+.label-halaman { text-align: center; align-self: center; min-width: 120px; }
+/* Tanpa ini, teks Halaman 1 / 1 terpotong jadi dua baris di antara kedua tombol. */
+.label-halaman * { white-space: nowrap; }
 #kotak-unggah .wrap { min-height: 0; }
 """
+
+def geser_halaman(daftar, indeks, arah):
+    if not daftar:
+        return gr.skip(), indeks, gr.skip()
+    i = max(0, min(len(daftar) - 1, indeks + arah))
+    return daftar[i], i, f"Halaman {i + 1} / {len(daftar)}"
+
+
+def _sel_nilai(isi):
+    if not isi:
+        return "galat"
+    if isi["status"] == "tidak ditemukan":
+        return "— (tidak ditemukan)"
+    return f"{isi['nilai']}  [{isi['status']}]"
+
+
+KOLOM_BIAYA = [
+    "Model", "Tingkat", "Token masuk", "Token keluar", "— berpikir",
+    "Biaya/dokumen (USD)", "Per 1.000 dokumen (USD)", "Waktu (s)",
+    "Field ditemukan", "Terbukti",
+]
+
+
+def jalankan_ekstraksi(markdown, field, model_dipilih, berkas, nama_mesin, daftar_halaman):
+    """Semua model terpilih mengambil field dari teks OCR yang SAMA, dijalankan paralel.
+
+    Teks yang sama untuk semua model, jadi beda token dan biaya di tabel murni beda
+    model — bukan beda hasil OCR. Tabel diperbarui setiap satu model selesai.
+    """
+    field = [f.strip() for f in (field or []) if f and f.strip()]
+    if not (markdown or "").strip():
+        raise gr.Error("Jalankan OCR dulu.")
+    if not field:
+        raise gr.Error("Isi minimal satu field.")
+    if not model_dipilih:
+        raise gr.Error("Pilih minimal satu model.")
+
+    teks = teks_untuk_llm(markdown)
+    dokumen = Path(berkas).name if berkas else "-"
+    nama = {i: n for i, n, *_ in MODEL_LLM}
+    tingkat = {i: t for i, _, t, *_ in MODEL_LLM}
+    baris_biaya, hasil_per_model, detail = [], {}, {}
+    # Diserahkan ke langkah analisis: field tiap model dan biaya ekstraksinya.
+    serah = {}
+
+    def tabel():
+        # Urut termurah dulu; model yang galat di paling bawah.
+        biaya = pd.DataFrame(
+            sorted(baris_biaya, key=lambda b: (b[5] == "", b[5] if b[5] != "" else 0)),
+            columns=KOLOM_BIAYA,
+        )
+        urutan = [m for m in model_dipilih if m in hasil_per_model]
+        nilai = pd.DataFrame(
+            [[f] + [_sel_nilai((hasil_per_model[m] or {}).get(f)) for m in urutan] for f in field],
+            columns=["Field"] + [nama.get(m, m) for m in urutan],
+        )
+        return biaya, nilai
+
+    yield (gr.skip(), gr.skip(),
+           f"Mengirim {len(teks):,} karakter teks OCR ke {len(model_dipilih)} model sekaligus...",
+           gr.skip(), gr.skip())
+
+    with ThreadPoolExecutor(max_workers=len(model_dipilih)) as pool:
+        tugas = {pool.submit(ambil_field, teks, field, m): m for m in model_dipilih}
+        for selesai in as_completed(tugas):
+            m = tugas[selesai]
+            try:
+                hasil, p, mentah = selesai.result()
+            except Exception as e:
+                hasil_per_model[m] = None
+                detail[m] = {"galat": str(e)}
+                baris_biaya.append([nama.get(m, m), tingkat.get(m, ""), "", "", "", "", "", "",
+                                    "galat", str(e)[:80]])
+            else:
+                semua = (hasil or {}).values()
+                ditemukan = sum(1 for h in semua if h["status"] != "tidak ditemukan")
+                terbukti = sum(1 for h in (hasil or {}).values() if h["status"] == "terbukti")
+                # Dicatat di utas utama, bukan di utas pekerja: menulis Excel dari beberapa
+                # utas sekaligus bisa menimpa baris satu sama lain.
+                catat(
+                    tahap="ekstraksi",
+                    dokumen=dokumen, mesin_ocr=nama_mesin, halaman=len(daftar_halaman or []),
+                    karakter_dikirim=len(teks), model=m, field_diminta=len(field),
+                    field_ditemukan=ditemukan, field_terbukti=terbukti, pemakaian=p,
+                    status="ok" if hasil is not None else "json tidak terbaca",
+                )
+                hasil_per_model[m] = hasil
+                if hasil is not None:
+                    serah[m] = {"hasil": hasil, "biaya_usd": p["biaya_usd"]}
+                detail[m] = {"pemakaian": p, "hasil": hasil}
+                if hasil is None:
+                    detail[m]["jawaban_mentah"] = mentah
+                baris_biaya.append([
+                    nama.get(m, m), tingkat.get(m, ""), p["token_masuk"], p["token_keluar"],
+                    p["token_berpikir"], round(p["biaya_usd"], 6), round(p["biaya_usd"] * 1000, 2),
+                    p["detik"], f"{ditemukan}/{len(field)}", f"{terbukti}/{len(field)}",
+                ])
+            biaya, nilai = tabel()
+            yield (biaya, nilai,
+                   f"{len(hasil_per_model)}/{len(model_dipilih)} model selesai · "
+                   f"teks OCR {len(teks):,} karakter",
+                   detail, serah)
+
+    biaya, nilai = tabel()
+    yield (biaya, nilai,
+           f"**Selesai** — {len(model_dipilih)} model · teks OCR {len(teks):,} karakter · "
+           f"tercatat di `hasil/biaya-token-llm.xlsx`",
+           detail, serah)
+
+
+def baca_file(path):
+    """Isi file unggahan (.json / .md) untuk dimasukkan ke editornya."""
+    return Path(path).read_text(encoding="utf-8") if path else gr.skip()
+
+
+def isi_scan_md(markdown):
+    """Setelah OCR: salin teksnya — tanpa potongan gambar — ke masukan analisis."""
+    return teks_untuk_llm(markdown)
+
+
+KOLOM_BIAYA_ANALISIS = [
+    "Model", "Tingkat", "Token masuk", "— dari cache", "Token keluar", "— berpikir",
+    "Biaya analisis (USD)", "Biaya ekstraksi (USD)", "Total per dokumen (USD)",
+    "Per 1.000 dokumen (USD)", "Waktu (s)",
+]
+
+
+def jalankan_analisis(json_hazard, scan_md, system_prompt, model_dipilih, serah,
+                      berkas, nama_mesin, daftar_halaman):
+    """Semua model terpilih menganalisis tiga masukan yang SAMA, dijalankan paralel.
+
+    Masukan yang sama untuk semua model, jadi beda token dan biaya murni beda model.
+    """
+    json_hazard = (json_hazard or "").strip()
+    if json_hazard:
+        try:
+            json.loads(json_hazard)
+        except json.JSONDecodeError as e:
+            raise gr.Error(f"JSON hazard tidak sah: {e}")
+    scan_md = (scan_md or "").strip()
+    if not json_hazard and not scan_md:
+        raise gr.Error("JSON hazard dan markdown scan OCR dua-duanya kosong — tidak ada yang "
+                       "bisa dianalisis.")
+    if not (system_prompt or "").strip():
+        raise gr.Error("System prompt kosong.")
+    if not model_dipilih:
+        raise gr.Error("Pilih minimal satu model.")
+
+    ukuran = {"prompt": len(system_prompt), "json": len(json_hazard), "md": len(scan_md)}
+    rincian = (f"system prompt {ukuran['prompt']:,} · JSON hazard {ukuran['json']:,} · "
+               f"scan OCR {ukuran['md']:,} karakter")
+    if not json_hazard:
+        rincian += " · **tanpa JSON hazard**"
+    if not scan_md:
+        rincian += " · **tanpa scan OCR**"
+    dokumen = Path(berkas).name if berkas else "-"
+    nama = {i: n for i, n, *_ in MODEL_LLM}
+    tingkat = {i: t for i, _, t, *_ in MODEL_LLM}
+    baris_biaya, jawaban, detail = [], {}, {}
+
+    def tampilan():
+        # Urut termurah dulu (total bila ada, selain itu biaya analisis); galat di bawah.
+        biaya = pd.DataFrame(
+            sorted(baris_biaya, key=lambda b: (b[6] == "", b[8] == "", b[8] or b[6] or 0)),
+            columns=KOLOM_BIAYA_ANALISIS,
+        )
+        teks = "\n\n---\n\n".join(
+            f"### {nama.get(m, m)}\n\n{jawaban[m]}" for m in model_dipilih if m in jawaban
+        )
+        return biaya, teks
+
+    yield (gr.skip(), gr.skip(), f"Menganalisis dengan {len(model_dipilih)} model · {rincian}",
+           gr.skip())
+
+    with ThreadPoolExecutor(max_workers=len(model_dipilih)) as pool:
+        tugas = {pool.submit(analisis, json_hazard, scan_md, system_prompt, m): m
+                 for m in model_dipilih}
+        for selesai in as_completed(tugas):
+            m = tugas[selesai]
+            try:
+                teks, p = selesai.result()
+            except Exception as e:
+                detail[m] = {"galat": str(e)}
+                jawaban[m] = f"_Galat: {e}_"
+                baris_biaya.append([nama.get(m, m), tingkat.get(m, "")] + [""] * 9)
+            else:
+                # Dicatat di utas utama: menulis Excel dari beberapa utas bisa saling timpa.
+                catat(
+                    tahap="analisis", dokumen=dokumen, mesin_ocr=nama_mesin,
+                    halaman=len(daftar_halaman or []), karakter_dikirim=sum(ukuran.values()),
+                    karakter_system_prompt=ukuran["prompt"], karakter_json_hazard=ukuran["json"],
+                    karakter_scan_md=ukuran["md"], model=m, pemakaian=p,
+                    status="ok" if teks.strip() else "jawaban kosong",
+                )
+                biaya_ekstraksi = (serah or {}).get(m, {}).get("biaya_usd")
+                total = p["biaya_usd"] + biaya_ekstraksi if biaya_ekstraksi is not None else None
+                baris_biaya.append([
+                    nama.get(m, m), tingkat.get(m, ""), p["token_masuk"], p["token_cache"],
+                    p["token_keluar"], p["token_berpikir"], round(p["biaya_usd"], 6),
+                    round(biaya_ekstraksi, 6) if biaya_ekstraksi is not None else "",
+                    round(total, 6) if total is not None else "",
+                    round(total * 1000, 2) if total is not None else "",
+                    p["detik"],
+                ])
+                jawaban[m] = teks.strip() or "_Jawaban kosong._"
+                detail[m] = {"pemakaian": p}
+            biaya, teks_md = tampilan()
+            yield (biaya, teks_md, f"{len(jawaban)}/{len(model_dipilih)} model selesai · {rincian}",
+                   detail)
+
+    biaya, teks_md = tampilan()
+    yield (biaya, teks_md,
+           f"**Selesai** — {len(model_dipilih)} model · {rincian} · "
+           f"tercatat di `hasil/biaya-token-llm.xlsx`",
+           detail)
+
+
+def llm_aktif():
+    """Sakelar OPEN_ROUTER_ENALBLE dibaca ulang dari .env setiap kali, bukan sekali di awal:
+    mengubah .env lalu me-refresh browser sudah cukup, tanpa restart app."""
+    return baca_env().get("OPEN_ROUTER_ENALBLE", "true").lower() == "true"
+
+
+def atur_tampilan():
+    """Saat halaman dimuat: tampilkan bagian LLM ATAU bagian parsing aturan, sesuai sakelar."""
+    aktif = llm_aktif()
+    return gr.Column(visible=aktif), gr.Column(visible=not aktif)
+
+
+KOLOM_FIELD_ATURAN = ["Field", "Nilai", "Label di dokumen / alasan", "Cara", "Sumber",
+                      "Halaman", "Catatan"]
+
+
+def isi_field_aturan(mentah_ocr, diminta):
+    """Setelah OCR: nilai field lewat parser tanpa LLM (tanpa token).
+
+    Parser membaca output MENTAH, bukan markdown, karena butuh posisi (bbox) tiap blok:
+    label dan nilainya dipasangkan juga lewat letak, bukan hanya lewat tabel.
+    """
+    diminta = [f.strip() for f in (diminta or []) if f and f.strip()]
+    if not diminta or not (mentah_ocr or "").strip():
+        return pd.DataFrame(columns=KOLOM_FIELD_ATURAN)
+    hasil = cari_field(mentah_ocr, diminta)
+    baris = []
+    for f in diminta:
+        h = hasil.get(f, {})
+        if h.get("nilai"):
+            baris.append([f, h["nilai"], h.get("label_ditemukan", ""), h.get("cara", ""),
+                          h.get("sumber", ""), h.get("halaman", ""), h.get("catatan", "")])
+        else:
+            label = h.get("label_ditemukan")
+            alasan = h.get("alasan", "tidak ditemukan") + (f" ({label})" if label else "")
+            baris.append([f, "", alasan, "", "", "", ""])
+    return pd.DataFrame(baris, columns=KOLOM_FIELD_ATURAN)
+
+
+def _label_model(m):
+    id_model, nama, tingkat, skor, masuk, keluar = m
+    return (f"{nama} · {tingkat} · skor {skor} · ${masuk:g}/${keluar:g} per 1 jt token", id_model)
+
 
 with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
     gr.Markdown(
@@ -342,13 +644,26 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
             512, 8192, value=4096, step=512, label="Maks token (Unlimited-OCR saja)"
         )
     prompt = gr.Textbox(value=PROMPT, label="Prompt (Unlimited-OCR saja)")
+    field_pilih = gr.Dropdown(
+        FIELD_BAWAAN,
+        value=FIELD_BAWAAN,
+        multiselect=True,
+        allow_custom_value=True,
+        label="Field yang dicari",
+        info="Tekan Enter untuk menambah. Dengan LLM: tulis bahasa biasa, LLM mencocokkan "
+             "arti. Tanpa LLM (parsing aturan): tulis label persis seperti di dokumen.",
+    )
     tombol = gr.Button("Jalankan OCR", variant="primary")
     status = gr.Markdown("")
 
     with gr.Row(equal_height=True):
         with gr.Column(elem_classes=["kolom-panel"]):
             gr.Markdown("### Dokumen")
-            tampil = gr.Image(show_label=False, height=580, type="pil")
+            tampil = gr.Image(show_label=False, height=530, type="pil")
+            with gr.Row():
+                tombol_sebelum = gr.Button("◀ Sebelumnya", size="sm")
+                label_halaman = gr.Markdown("", elem_classes=["label-halaman"])
+                tombol_sesudah = gr.Button("Berikutnya ▶", size="sm")
         with gr.Column(elem_classes=["kolom-panel"]):
             gr.Markdown("### Output mentah")
             # Textbox, bukan Code: hanya Textbox yang punya autoscroll. Tanpa itu,
@@ -363,10 +678,130 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
             gr.Markdown("### Markdown")
             bersih = gr.Markdown(height=580, container=True)
 
+    gambar_halaman = gr.State([])
+    indeks_halaman = gr.State(0)
+
+    with gr.Column(visible=not llm_aktif()) as bagian_aturan:
+        gr.Markdown(
+            "### Nilai field — parsing aturan\n"
+            "LLM dimatikan (`OPEN_ROUTER_ENALBLE=false` di `.env`), jadi nilai field dicari "
+            "parser tanpa token ([`parser_field.py`](parser_field.py)). Label dicocokkan "
+            "dengan kamus sebutan (\"nama lengkap\" juga menemukan \"Nama Tertanggung\"), "
+            "lalu nilainya diambil dari baris yang sama, kotak tabel sebelahnya, atau letaknya "
+            "(kanan/bawah label). Kalau nilainya meragukan, kolom dibiarkan kosong beserta "
+            "alasannya — bukan ditebak."
+        )
+        tabel_field_aturan = gr.Dataframe(headers=KOLOM_FIELD_ATURAN, interactive=False,
+                                          wrap=True)
+
+    with gr.Column(visible=llm_aktif()) as bagian_llm:
+        gr.Markdown(
+            "### Ambil field dengan LLM\n"
+            "Semua model membaca teks OCR yang sama, jadi beda token dan biaya di bawah murni "
+            "beda model. Skor kualitas: BenchLM · harga: OpenRouter, USD per 1 juta token "
+            "masuk/keluar."
+        )
+        with gr.Row():
+            model_llm = gr.Dropdown(
+                [_label_model(m) for m in MODEL_LLM],
+                value=MODEL_BAWAAN,
+                multiselect=True,
+                label="Model yang dibandingkan",
+                scale=4,
+            )
+            tombol_llm = gr.Button("Ambil field dengan LLM", variant="primary", scale=1)
+        status_llm = gr.Markdown("")
+        gr.Markdown("#### Token dan biaya per dokumen")
+        tabel_biaya = gr.Dataframe(interactive=False, wrap=True)
+        gr.Markdown(
+            "#### Nilai field per model\n"
+            "`terbukti` = tertulis di teks OCR · `ditafsirkan` = LLM membetulkan salah baca OCR, "
+            "belum tentu benar · `tidak terbukti` = kutipannya tidak ada di teks OCR, jangan dipercaya"
+        )
+        tabel_nilai = gr.Dataframe(interactive=False, wrap=True)
+        with gr.Accordion("Rincian jawaban per model (JSON)", open=False):
+            detail_llm = gr.JSON()
+        hasil_ekstraksi = gr.State({})
+
+        gr.Markdown(
+            "### Analisis risiko LLM\n"
+            "Tiga masukan: **JSON hazard** (sementara simulasi — nantinya dari API risk analysis), "
+            "**markdown scan OCR** (terisi otomatis setelah OCR), dan **system prompt**. System "
+            "prompt dikirim paling depan dan sama persis di setiap dokumen — bagian itulah yang "
+            "bisa di-cache penyedia model."
+        )
+        with gr.Row():
+            with gr.Column():
+                file_json = gr.File(label="Unggah JSON hazard (.json)", file_types=[".json"],
+                                    type="filepath")
+                json_hazard = gr.Code(
+                    value=(AKAR / "contoh" / "hazard-api-contoh.json").read_text(encoding="utf-8"),
+                    language="json",
+                    label="JSON hazard — terisi contoh dari API; ganti, tempel, atau unggah",
+                    lines=14,
+                )
+            with gr.Column():
+                file_prompt = gr.File(label="Unggah system prompt (.md)", file_types=[".md", ".txt"],
+                                      type="filepath")
+                prompt_analisis = gr.Textbox(value=PROMPT_ANALISIS, label="System prompt", lines=14)
+        with gr.Accordion("Markdown scan OCR yang dikirim", open=False):
+            scan_md = gr.Code(language="markdown", lines=16,
+                              label="Terisi otomatis setelah OCR; boleh diedit atau ditempel")
+        with gr.Row():
+            model_analisis = gr.Dropdown(
+                [_label_model(m) for m in MODEL_LLM],
+                value=MODEL_BAWAAN,
+                multiselect=True,
+                label="Model analisis",
+                scale=4,
+            )
+            tombol_analisis = gr.Button("Analisis", variant="primary", scale=1)
+        status_analisis = gr.Markdown("")
+        gr.Markdown(
+            "#### Token dan biaya per dokumen — ekstraksi + analisis\n"
+            "Biaya ekstraksi diambil dari model yang sama pada langkah di atas. Total hanya terisi "
+            "kalau model itu menjalani kedua langkah."
+        )
+        tabel_biaya_analisis = gr.Dataframe(interactive=False, wrap=True)
+        gr.Markdown("#### Hasil analisis per model")
+        hasil_analisis = gr.Markdown("")
+        with gr.Accordion("Rincian pemakaian per model (JSON)", open=False):
+            detail_analisis = gr.JSON()
+
     tombol.click(
         jalankan,
         inputs=[berkas, mesin, dpi, max_tokens, prompt],
-        outputs=[tampil, mentah, bersih, status],
+        outputs=[tampil, mentah, bersih, status, gambar_halaman, indeks_halaman, label_halaman],
+    ).success(isi_scan_md, inputs=[bersih], outputs=[scan_md]).success(
+        isi_field_aturan, inputs=[mentah, field_pilih], outputs=[tabel_field_aturan])
+
+    demo.load(atur_tampilan, outputs=[bagian_llm, bagian_aturan])
+
+    tombol_sebelum.click(
+        lambda d, i: geser_halaman(d, i, -1),
+        inputs=[gambar_halaman, indeks_halaman],
+        outputs=[tampil, indeks_halaman, label_halaman],
+    )
+    tombol_sesudah.click(
+        lambda d, i: geser_halaman(d, i, 1),
+        inputs=[gambar_halaman, indeks_halaman],
+        outputs=[tampil, indeks_halaman, label_halaman],
+    )
+
+    tombol_llm.click(
+        jalankan_ekstraksi,
+        inputs=[bersih, field_pilih, model_llm, berkas, mesin, gambar_halaman],
+        outputs=[tabel_biaya, tabel_nilai, status_llm, detail_llm, hasil_ekstraksi],
+    )
+
+    file_json.upload(baca_file, inputs=[file_json], outputs=[json_hazard])
+    file_prompt.upload(baca_file, inputs=[file_prompt], outputs=[prompt_analisis])
+
+    tombol_analisis.click(
+        jalankan_analisis,
+        inputs=[json_hazard, scan_md, prompt_analisis, model_analisis, hasil_ekstraksi,
+                berkas, mesin, gambar_halaman],
+        outputs=[tabel_biaya_analisis, hasil_analisis, status_analisis, detail_analisis],
     )
 
 if __name__ == "__main__":

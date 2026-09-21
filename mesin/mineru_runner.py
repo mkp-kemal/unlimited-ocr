@@ -30,13 +30,24 @@ def kirim(**ev):
 
 
 def isi_blok(blok):
-    """Gabungkan span jadi satu teks; blok gambar bisa tidak punya teks sama sekali."""
+    """Gabungkan span jadi satu teks, termasuk dari sub-blok.
+
+    Tabel menyimpan isinya satu tingkat lebih dalam (`table` -> `table_body` -> span
+    ber-`html`), bukan di `lines` blok induknya. Versi sebelumnya hanya membaca tingkat
+    teratas, dan akibatnya seluruh isi tabel hilang: tujuh tabel di dokumen SPPA keluar
+    kosong, lalu dirender sebagai gambar. Layanan OCR tidak kena masalah ini karena ia
+    memakai markdown buatan MinerU sendiri.
+    """
     bagian = []
     for baris in blok.get("lines", []):
         for span in baris.get("spans", []):
             teks = span.get("content") or span.get("html") or ""
             if teks:
                 bagian.append(teks)
+    for anak in blok.get("blocks", []):
+        teks = isi_blok(anak)
+        if teks:
+            bagian.append(teks)
     return " ".join(bagian).strip()
 
 
@@ -59,6 +70,7 @@ def main(berkas):
     t_ocr = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmp:
         for i in range(jumlah):
+            kirim(t="halaman_mulai", n=i + 1)
             t = time.perf_counter()
             do_parse(
                 output_dir=tmp,

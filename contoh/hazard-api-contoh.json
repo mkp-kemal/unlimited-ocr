@@ -1,0 +1,46 @@
+{
+  "risk": {
+    "drought": {
+      "value": "60",
+      "category": "High"
+    },
+    "earthquake": {
+      "value": "14",
+      "category": "Very Low"
+    },
+    "extreme_weather": {
+      "value": "4",
+      "category": "Very Low"
+    },
+    "flood": {
+      "value": "58",
+      "category": "Medium"
+    },
+    "land_forest_fire": {
+      "value": "13",
+      "category": "Very Low"
+    },
+    "landslide": {
+      "value": "22",
+      "category": "Low"
+    },
+    "liquefaction": {
+      "value": "0",
+      "category": "None"
+    },
+    "tsunami": {
+      "value": "0",
+      "category": "None"
+    },
+    "volcanic_eruption": {
+      "value": "0",
+      "category": "None"
+    }
+  },
+  "coordinates": [
+    108.86388660006656,
+    -7.347105071649153
+  ],
+  "overall_score": 10.8376,
+  "overall_score_category": "Very Low"
+}

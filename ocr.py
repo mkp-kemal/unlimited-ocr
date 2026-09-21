@@ -18,6 +18,7 @@ PROMPT = "document parsing."
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
+
 def pdf_ke_gambar(pdf_path, dpi, halaman, tmpdir):
     import fitz
 
@@ -111,8 +112,13 @@ def blok_ke_markdown(blok, pada_gambar=None):
     baris = []
     for kategori, bbox, isi in blok:
         k = (kategori or "").lower()
-        # "image_caption" mengandung "image" tapi isinya teks keterangan, bukan gambar.
-        gambar = "caption" not in k and (any(v in k for v in VISUAL) or not isi)
+        # Dicocokkan per KATA kategori, bukan potongan huruf: "paragraph_title" memuat
+        # "graph", dan pencocokan potongan pernah membuat setiap judul paragraf
+        # PaddleOCR-VL dirender sebagai gambar sehingga teks judulnya hilang.
+        kata = set(k.split("_"))
+        # "image_caption"/"figure_title" memuat kata gambar tapi isinya teks keterangan.
+        keterangan = bool(kata & {"caption", "title"})
+        gambar = not keterangan and (bool(kata & set(VISUAL)) or not isi)
         if gambar:
             md = pada_gambar(bbox) if pada_gambar else None
             if md:

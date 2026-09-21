@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 SKALA = 1000.0
 SERVER = os.environ.get("PADDLE_VL_SERVER", "http://localhost:8111/")
@@ -40,6 +41,11 @@ def main(berkas):
     t_awal = time.perf_counter()
     from paddleocr import PaddleOCRVL
 
+    # Pembersihan LaTeX yang sama persis dengan layanan OCR, supaya nilai field yang
+    # dicari dari demo ini sama dengan yang didapat tool di datamapan.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "layanan"))
+    from inti import _bersih_latex
+
     pipeline = PaddleOCRVL(
         vl_rec_backend="mlx-vlm-server",
         vl_rec_server_url=SERVER,
@@ -49,6 +55,9 @@ def main(berkas):
 
     t_ocr = time.perf_counter()
     for nomor, path in enumerate(berkas, 1):
+        # Dikirim SEBELUM predict: satu halaman makan puluhan detik dan hasilnya keluar
+        # sekaligus, jadi tanpa sinyal ini layar diam dan tampak macet.
+        kirim(t="halaman_mulai", n=nomor)
         t = time.perf_counter()
         hasil = pipeline.predict(path)[0]
         lebar, tinggi = hasil["width"], hasil["height"]
@@ -65,7 +74,7 @@ def main(berkas):
                     round(x2 / lebar * SKALA),
                     round(y2 / tinggi * SKALA),
                 ],
-                teks=str(blok.content or "").strip(),
+                teks=_bersih_latex(str(blok.content or "")).strip(),
             )
         kirim(t="halaman_selesai", n=nomor, detik=round(time.perf_counter() - t, 2))
 

@@ -147,6 +147,97 @@ ada blok baru. Menyegarkan tiap token membuat UI tersendat karena menyusun ulang
 jauh lebih mahal daripada mengirim teks. Halaman pertama menunggu model dimuat (~4 detik);
 setelah itu model tetap di memori selama server hidup.
 
+## Mengambil field dengan LLM, dan biaya tokennya
+
+Alur di demo web: unggah dokumen → tulis field → OCR (lokal) → beberapa LLM mengambil
+nilai field dari teks OCR → tabel token & biaya per dokumen, dicatat ke Excel.
+
+OCR tetap berjalan di laptop tanpa token. LLM hanya dipakai untuk membaca teks hasil OCR
+dan mengisi field — pekerjaan yang di datamapan dilakukan aturan pencocokan label.
+
+**Field** ditulis dengan bahasa biasa ("nama lengkap", "nomor hp"); LLM mencocokkan arti,
+bukan tulisan label.
+
+**Yang dikirim ke LLM** adalah teks OCR tanpa gambar ([`field.py`](field.py)). Ini
+penting untuk biaya: markdown SPPA 3 halaman berukuran 106.828 karakter karena memuat
+potongan gambar, tapi yang dikirim hanya 6.292 karakter.
+
+**Setiap nilai wajib disertai kutipan persis dari teks OCR**, lalu diperiksa:
+
+| Status | Arti |
+| --- | --- |
+| terbukti | kutipan ada di teks OCR dan nilainya tertulis di situ |
+| ditafsirkan | kutipan ada, tapi LLM mengubah nilainya — biasanya membetulkan salah baca OCR; belum tentu benar |
+| tidak terbukti | kutipannya tidak ada di teks OCR; jangan dipercaya |
+| tidak ditemukan | LLM menjawab kosong |
+
+**Model** ([`llm.py`](llm.py)) disaring ke delapan dari tiga penyedia: per penyedia yang
+skornya tertinggi dan yang paling hemat. Skor dari [BenchLM](https://benchlm.ai/), harga
+dari API OpenRouter, keduanya dibaca 2026-09-17. Beberapa model bisa dipilih sekaligus;
+semuanya membaca teks OCR yang sama dan dijalankan paralel.
+
+**Biaya** dicatat [`biaya.py`](biaya.py) ke `hasil/biaya-ekstraksi-llm.xlsx`, satu baris
+per dokumen per model, angka token dan biaya langsung dari respons OpenRouter. Sheet
+`ringkasan` memakai rumus, jadi baru terhitung saat dibuka di Excel.
+
+Hasil uji pertama, SPPA 3 halaman, 7 field, teks OCR yang sama:
+
+| Model | Token masuk | Token keluar (berpikir) | Biaya/dokumen | Per 1.000 dok | Terbukti |
+| --- | --- | --- | --- | --- | --- |
+| GPT-5.6 Luna | 2.365 | 838 (516) | $0,0011 | $1,05 | 5/7 |
+| Gemini 3.5 Flash-Lite | 2.217 | 512 (0) | $0,0019 | $1,95 | 5/7 |
+| Claude Sonnet 5 | 4.008 | 4.335 (3.337) | $0,0514 | $51,37 | 3/7 |
+
+Yang termahal justru paling tidak setia pada teks: token "berpikir" membuatnya ~49×
+lebih mahal, dan dua nilainya ditafsirkan — satu keliru (tempat lahir diisi nama kota
+dari alamat). Token masuknya juga lebih besar untuk teks yang sama, karena tiap penyedia
+memecah teks jadi token dengan cara berbeda.
+
+`hasil/biaya-llm.xlsx` adalah sisa fitur lama (LLM menganalisis isi field) yang sudah
+dilepas; skemanya berbeda dan tidak dipakai lagi.
+
+### Analisis risiko
+
+Analisis membaca tiga masukan yang sama untuk semua model yang dipilih:
+
+- **JSON hazard** untuk lokasi objek — unggah `.json` atau tempel. Sementara disimulasikan;
+  nantinya dari API risk analysis.
+- **Markdown scan OCR** — terisi otomatis setelah OCR (tanpa potongan gambar), bisa diedit.
+- **System prompt** — isi awal ada di `llm.py` (`PROMPT_ANALISIS`), bisa diedit di form atau
+  diganti dengan mengunggah `.md`.
+
+System prompt dikirim sebagai pesan sistem (paling depan, sama persis antar dokumen,
+sehingga bisa di-cache penyedia); JSON hazard dan scan OCR sebagai pesan pengguna.
+Jawaban model berupa teks yang mudah dibaca, ditampilkan per model.
+
+Tabel biayanya menjumlahkan ekstraksi + analisis menjadi **total per dokumen** per model.
+Di Excel (`hasil/biaya-token-llm.xlsx`) kedua tahap tercatat di baris terpisah (kolom
+`tahap`); ukuran tiap masukan analisis dicatat di `karakter_system_prompt`,
+`karakter_json_hazard`, dan `karakter_scan_md`.
+
+Uji dengan JSON hazard simulasi pada SPPA 3 halaman: scan OCR (6.292 karakter) jauh lebih
+besar daripada system prompt (839) dan JSON hazard (388), jadi token analisis ditentukan
+terutama oleh panjang dokumen.
+
+## Mengambil field tanpa LLM
+
+Saat `OPEN_ROUTER_ENALBLE=false`, bagian LLM disembunyikan dan nilai field dicari oleh
+[`parser_field.py`](parser_field.py) — tanpa token, untuk ketiga engine. Parser membaca
+output mentah (blok + bbox), bukan markdown, jadi tidak bergantung pada tabel:
+
+1. **Label** dicocokkan lewat kamus sebutan (`KAMUS`): "nama lengkap" juga menemukan
+   "Nama Tertanggung"; salah ketik OCR ringan masih lolos (per kata, kemiripan ≥ 0,8).
+2. **Nilai** diambil berurutan dari: teks setelah `:` di baris yang sama → kotak tabel
+   sebelahnya → blok di kanan/bawah label (hanya untuk label di luar tabel).
+3. **Nilai ditolak** bila diawali label lain (`LABEL_UMUM`), bentuk NIK/nomor HP salah,
+   atau semua opsi pilihan muncul tanpa tanda centang. Label yang menempel di tengah
+   nilai dipotong ("… Kode Pos").
+
+Prinsipnya: lebih baik kosong beserta alasannya daripada nilai yang salah. Menambah
+sebutan baru cukup di `KAMUS`. Batasnya: parser tidak bisa membetulkan OCR — kalau
+engine menggabungkan label dengan nilai field lain dalam satu kotak, atau tidak membaca
+tanda centang, field itu kosong.
+
 ## Kecepatan terukur (M4, 16 GB)
 
 | Uji | Hasil |
