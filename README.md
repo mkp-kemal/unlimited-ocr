@@ -228,10 +228,49 @@ output mentah (blok + bbox), bukan markdown, jadi tidak bergantung pada tabel:
 1. **Label** dicocokkan lewat kamus sebutan (`KAMUS`): "nama lengkap" juga menemukan
    "Nama Tertanggung"; salah ketik OCR ringan masih lolos (per kata, kemiripan ≥ 0,8).
 2. **Nilai** diambil berurutan dari: teks setelah `:` di baris yang sama → kotak tabel
-   sebelahnya → blok di kanan/bawah label (hanya untuk label di luar tabel).
+   sebelahnya → **kotak isian formulir** yang sejajar dengan label → blok di kanan/bawah
+   label.
 3. **Nilai ditolak** bila diawali label lain (`LABEL_UMUM`), bentuk NIK/nomor HP salah,
    atau semua opsi pilihan muncul tanpa tanda centang. Label yang menempel di tengah
    nilai dipotong ("… Kode Pos").
+
+**Formulir dua kolom** — label bernomor di kiri, satu kotak jawaban panjang di kanan —
+perlu penanganan khusus. Engine memberi kolom jawaban itu sebagai tabel satu kolom tanpa
+label sama sekali, jadi hubungan "label nomor 5 ↔ kotak kelima" hilang, dan letak tiap
+baris di dalam blok hanya bisa ditebak dari tinggi blok dibagi rata. Pada tulisan tangan
+tebakan itu meleset: alamat memakan tiga baris, "Jumlah Lantai" satu baris tipis. Karena
+itu hubungannya disusun ulang dari gambar halaman:
+
+- [`mesin/baris_runner.py`](mesin/baris_runner.py) mendeteksi letak tiap baris teks
+  (deteksi saja, tanpa membaca; ±1,4 detik per halaman di CPU, lewat `.venv-paddle`).
+- Batas kotak diambil dari **garis cetak formulir** — garis itulah batas field yang
+  sebenarnya, sehingga alamat tiga baris menyatu dan kotak kosong tetap terlihat kosong.
+- Kotak yang tidak punya baris teks dinyatakan kosong, dan pencarian berhenti di situ.
+  Formulirnya sendiri yang bilang field itu tidak diisi, jadi jangan meraba blok tetangga.
+- Kalau jumlah baris tabel dan baris terdeteksi tidak bisa dicocokkan, tabel itu
+  dilewati. Memasangkan dua daftar yang panjangnya beda hanya menggeser nilai sekotak.
+
+**Tanda centang tidak diambil dari teks OCR.** Engine hanya menulis ulang teksnya, dan
+tandanya kerap salah — semua opsi tertulis ☐ padahal ada yang dicentang, atau kotaknya
+tidak ditulis sama sekali. Nilainya jadi salah tanpa terlihat salah. Karena itu kotak
+centang dibaca dari gambar, di [`mesin/baris_runner.py`](mesin/baris_runner.py):
+
+1. Kotak **kosong** mudah dikenali: persegi, keempat sisinya bergaris, isinya bersih,
+   sekelilingnya kertas kosong. Dari sini ukuran kotak dan kepadatan garis **dipelajari**,
+   tidak ditebak — tiap formulir mencetaknya berbeda.
+2. Kotak **tercentang** tidak bisa dikenali lewat bentuk, karena coretannya keluar dari
+   garis. Yang dicari hanya bingkainya, dan hanya di baris serta kolom tempat kotak
+   kosong tadi berdiri. Sisa salah tangkap berupa huruf di tengah kata dibuang: kotak
+   centang selalu didahului ruang kosong.
+3. Hasilnya dipasangkan berurutan dengan tanda di teks — dan **hanya kalau letak baris
+   itu pasti**, yaitu saat jumlah baris blok sama dengan jumlah baris yang terdeteksi.
+   Dengan letak yang masih perkiraan, deretan kotak milik baris sebelahnya bisa terpakai.
+4. Kalau barisnya punya kotak pilihan tapi tandanya tidak terbaca sama sekali, field itu
+   dikosongkan dengan alasan — bukan diisi salah satu opsi.
+
+Terukur pada SPPA JASINDO halaman 1: 8 kotak tercentang, tidak ada salah tangkap, dan
+keenam field pilihan (jenis kelamin, agama, kewarganegaraan, status perkawinan,
+pekerjaan, sumber dana) terbaca benar.
 
 Prinsipnya: lebih baik kosong beserta alasannya daripada nilai yang salah. Menambah
 sebutan baru cukup di `KAMUS`. Batasnya: parser tidak bisa membetulkan OCR — kalau

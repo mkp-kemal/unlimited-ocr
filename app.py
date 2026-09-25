@@ -11,6 +11,7 @@ Jalankan: .venv/bin/python app.py  ->  http://127.0.0.1:7860
 import base64
 import io
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -24,6 +25,7 @@ from PIL import Image, ImageDraw
 from biaya import catat
 from field import FIELD_BAWAAN, teks_untuk_llm
 from parser_field import cari as cari_field
+from parser_field import tata_letak
 from llm import MODEL_BAWAAN, MODEL_LLM, PROMPT_ANALISIS, ambil_field, analisis, baca_env
 from ocr import (
     IMAGE_EXT,
@@ -59,6 +61,17 @@ MESIN = {
         "skrip": AKAR / "mesin/mineru_runner.py",
         "umpan": "dokumen",
         "catatan": "pipeline deteksi+rekognisi, blok diputar per halaman",
+    },
+    "MinerU hybrid — VLM": {
+        "jenis": "subproses",
+        "python": AKAR.parent / ".venv-mineru/bin/python",
+        "skrip": AKAR / "mesin/mineru_runner.py",
+        "umpan": "dokumen",
+        # Isi tabel dibaca VLM, bukan pengenal tabel pipeline. Pada formulir tulisan
+        # tangan struktur selnya jauh lebih benar — di SPPA JASINDO, "Nama Lengkap" baru
+        # punya nilai lewat jalur ini — tapi ongkosnya ±60 detik/halaman, 7x pipeline.
+        "catatan": "isi tabel dibaca VLM, sel lebih benar, ±60 detik/halaman",
+        "env": {"MINERU_BACKEND": "hybrid-engine"},
     },
     "PaddleOCR-VL — MLX": {
         "jenis": "subproses",
@@ -224,6 +237,7 @@ def jalankan_subproses(cfg, src, gambar, halaman, cache):
         text=True,
         bufsize=1,
         cwd=AKAR,
+        env={**os.environ, **cfg.get("env", {})},
     )
 
     pil_per_halaman = dict(halaman)
@@ -595,22 +609,28 @@ KOLOM_FIELD_ATURAN = ["Field", "Nilai", "Label di dokumen / alasan", "Cara", "Su
                       "Halaman", "Catatan"]
 
 
-def isi_field_aturan(mentah_ocr, diminta):
+def isi_field_aturan(mentah_ocr, diminta, berkas, dpi):
     """Setelah OCR: nilai field lewat parser tanpa LLM (tanpa token).
 
     Parser membaca output MENTAH, bukan markdown, karena butuh posisi (bbox) tiap blok:
     label dan nilainya dipasangkan juga lewat letak, bukan hanya lewat tabel.
+
+    Halaman dirender ulang dan barisnya dideteksi (±1,4 detik per halaman) untuk
+    menemukan kotak isian formulir. Tanpa itu, formulir dua kolom — label di kiri, kotak
+    jawaban di kanan — tidak bisa dipasangkan.
     """
     diminta = [f.strip() for f in (diminta or []) if f and f.strip()]
     if not diminta or not (mentah_ocr or "").strip():
         return pd.DataFrame(columns=KOLOM_FIELD_ATURAN)
-    hasil = cari_field(mentah_ocr, diminta)
+    hasil = cari_field(mentah_ocr, diminta, tata_letak(berkas, int(dpi or 200)))
     baris = []
     for f in diminta:
         h = hasil.get(f, {})
         if h.get("nilai"):
+            hal = h.get("halaman")
             baris.append([f, h["nilai"], h.get("label_ditemukan", ""), h.get("cara", ""),
-                          h.get("sumber", ""), h.get("halaman", ""), h.get("catatan", "")])
+                          h.get("sumber", ""), "" if hal is None else str(hal),
+                          h.get("catatan", "")])
         else:
             label = h.get("label_ditemukan")
             alasan = h.get("alasan", "tidak ditemukan") + (f" ({label})" if label else "")
@@ -650,8 +670,9 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
         multiselect=True,
         allow_custom_value=True,
         label="Field yang dicari",
-        info="Tekan Enter untuk menambah. Dengan LLM: tulis bahasa biasa, LLM mencocokkan "
-             "arti. Tanpa LLM (parsing aturan): tulis label persis seperti di dokumen.",
+        info="Tekan Enter untuk menambah. Tulis bahasa biasa: dengan LLM artinya "
+             "dicocokkan, tanpa LLM parser memakai kamus sebutan dan tahan salah baca "
+             "OCR ringan. Untuk label tak lazim, tulis mirip yang tertulis di dokumen.",
     )
     tombol = gr.Button("Jalankan OCR", variant="primary")
     status = gr.Markdown("")
@@ -687,9 +708,11 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
             "LLM dimatikan (`OPEN_ROUTER_ENALBLE=false` di `.env`), jadi nilai field dicari "
             "parser tanpa token ([`parser_field.py`](parser_field.py)). Label dicocokkan "
             "dengan kamus sebutan (\"nama lengkap\" juga menemukan \"Nama Tertanggung\"), "
-            "lalu nilainya diambil dari baris yang sama, kotak tabel sebelahnya, atau letaknya "
-            "(kanan/bawah label). Kalau nilainya meragukan, kolom dibiarkan kosong beserta "
-            "alasannya — bukan ditebak."
+            "lalu nilainya diambil dari baris yang sama, kotak tabel sebelahnya, **kotak "
+            "isian formulir** yang sejajar dengan label, atau letaknya (kanan/bawah label). "
+            "Batas kotak isian dibaca dari garis cetak formulir, jadi kotak yang memang "
+            "tidak diisi tetap kosong. Kalau nilainya meragukan, kolom dibiarkan kosong "
+            "beserta alasannya — bukan ditebak."
         )
         tabel_field_aturan = gr.Dataframe(headers=KOLOM_FIELD_ATURAN, interactive=False,
                                           wrap=True)
@@ -773,7 +796,8 @@ with gr.Blocks(title="Banding OCR — Apple Silicon") as demo:
         inputs=[berkas, mesin, dpi, max_tokens, prompt],
         outputs=[tampil, mentah, bersih, status, gambar_halaman, indeks_halaman, label_halaman],
     ).success(isi_scan_md, inputs=[bersih], outputs=[scan_md]).success(
-        isi_field_aturan, inputs=[mentah, field_pilih], outputs=[tabel_field_aturan])
+        isi_field_aturan, inputs=[mentah, field_pilih, berkas, dpi],
+        outputs=[tabel_field_aturan])
 
     demo.load(atur_tampilan, outputs=[bagian_llm, bagian_aturan])
 

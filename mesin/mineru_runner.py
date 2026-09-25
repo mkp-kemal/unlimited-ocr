@@ -24,6 +24,12 @@ os.environ.setdefault("MINERU_MODEL_SOURCE", "huggingface")
 
 SKALA = 1000.0
 
+# "pipeline" cepat (±9 detik/halaman) tapi struktur tabelnya sering rusak pada formulir
+# tulisan tangan: label dan nilai field lain bisa tergabung dalam satu sel, sehingga
+# "Nama Lengkap" tidak punya nilai. "hybrid-engine" memakai VLM untuk isi tabel dan
+# memberi sel yang benar, dengan ongkos ±61 detik/halaman — terukur pada SPPA JASINDO.
+BACKEND = os.environ.get("MINERU_BACKEND", "pipeline")
+
 
 def kirim(**ev):
     print(json.dumps(ev, ensure_ascii=False), flush=True)
@@ -77,7 +83,7 @@ def main(berkas):
                 pdf_file_names=[f"hal{i}"],
                 pdf_bytes_list=[pdf_bytes],
                 p_lang_list=["ch"],  # tidak ada kode "id"/"en"; model ch yang menangani Latin
-                backend="pipeline",
+                backend=BACKEND,
                 start_page_id=i,
                 end_page_id=i,
                 f_draw_layout_bbox=False,
