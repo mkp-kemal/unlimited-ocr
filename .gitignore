@@ -16,3 +16,6 @@ model/
 
 # macOS
 .DS_Store
+
+# Kunci API — jangan pernah masuk git (pernah memblokir push GitHub)
+.env
